@@ -85,7 +85,7 @@ for f in uploaded:
         else:
             lista_dfs.append((f.name, df))
     except Exception as e:
-        errores.append((f.name, None))
+        errores.append((f.name, [f"ERROR: {e}"]))
 
 for nombre, cols in errores:
     if cols:
