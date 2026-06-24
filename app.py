@@ -39,13 +39,23 @@ st.markdown(f"**{len(uploaded)} archivo(s) cargado(s)**")
 # ── Process ───────────────────────────────────────────────────────────────────
 def read_file(f):
     name = f.name.lower()
+    raw = f.read()
+    f.seek(0)
+
     if name.endswith(".csv"):
         return pd.read_csv(f)
+
     elif name.endswith(".xls"):
-        try:
+        # DealerApps exports .xls files that are actually HTML tables.
+        # Detect by sniffing the first bytes — real XLS starts with 0xD0CF.
+        is_html = not raw[:8].startswith(b"\xd0\xcf\x11\xe0")
+        if is_html:
+            import io
+            dfs = pd.read_html(io.BytesIO(raw), header=0)
+            return dfs[0] if dfs else None
+        else:
             return pd.read_excel(f, engine="xlrd")
-        except Exception:
-            return pd.read_html(f, header=0)[0]
+
     else:
         return pd.read_excel(f)
 
@@ -53,14 +63,14 @@ def read_file(f):
 def find_tag_column(df):
     df.columns = df.columns.astype(str).str.strip()
     if COLUMNA_PLACA in df.columns:
-        return df
+        return df, None
     for i in range(min(10, len(df))):
         if COLUMNA_PLACA in [str(v).strip() for v in df.iloc[i].values]:
             df.columns = df.iloc[i].values
             df = df.iloc[i + 1:].reset_index(drop=True)
             df.columns = df.columns.astype(str).str.strip()
-            return df
-    return None
+            return df, None
+    return None, df.columns.tolist()
 
 
 lista_dfs = []
@@ -69,16 +79,25 @@ errores = []
 for f in uploaded:
     try:
         df = read_file(f)
-        df = find_tag_column(df)
+        df, cols_encontradas = find_tag_column(df)
         if df is None:
-            errores.append(f"**{f.name}** — no tiene columna TAG, ignorado.")
+            errores.append((f.name, cols_encontradas))
         else:
             lista_dfs.append((f.name, df))
     except Exception as e:
-        errores.append(f"**{f.name}** — error al leer: {e}")
+        errores.append((f.name, None))
 
-for err in errores:
-    st.warning(err)
+for nombre, cols in errores:
+    if cols:
+        st.warning(
+            f"**{nombre}** — ignorado, no tiene columna **TAG** (placa). "
+            f"Este archivo es probablemente un reporte diferente. "
+            f"Columnas encontradas: `{', '.join(str(c) for c in cols[:12])}`\n\n"
+            f"Asegurate de exportar el reporte **Open Repair Orders** o **Finished Repair Orders** "
+            f"que incluya la columna TAG."
+        )
+    else:
+        st.error(f"**{nombre}** — no se pudo leer el archivo.")
 
 if not lista_dfs:
     st.error("Ningún archivo tiene la columna TAG. Revisa los archivos subidos.")
