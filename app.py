@@ -156,6 +156,23 @@ def build_excel(data_json: str) -> bytes:
             "columns": [{"header": c} for c in df_out.columns],
             "style": "Table Style Medium 9",
         })
+
+        # ── Hoja dedicada: solo OTs FACTURADAS ──
+        _status_col = next((c for c in df_out.columns if str(c).strip().upper() in ("STATUS", "ESTATUS", "ESTADO")), None)
+        if _status_col is not None:
+            df_fact = df_out[df_out[_status_col].astype(str).str.upper().str.contains("FACTURAD", na=False)]
+        else:
+            df_fact = df_out.iloc[0:0]
+        df_fact.to_excel(writer, sheet_name="Facturadas", index=False)
+        if len(df_fact) > 0:
+            ws_f = writer.sheets["Facturadas"]
+            for i, col in enumerate(df_fact.columns):
+                ancho = max(df_fact[col].astype(str).map(len).max(), len(str(col))) + 2
+                ws_f.set_column(i, i, min(ancho, 50))
+            ws_f.add_table(0, 0, len(df_fact), len(df_fact.columns) - 1, {
+                "columns": [{"header": c} for c in df_fact.columns],
+                "style": "Table Style Medium 3",
+            })
     return buf.getvalue()
 
 
@@ -163,6 +180,11 @@ st.divider()
 
 with st.spinner("Generando archivo..."):
     excel_bytes = build_excel(df_combined.to_json(orient="records"))
+
+_status_col_ui = next((c for c in df_combined.columns if str(c).strip().upper() in ("STATUS", "ESTATUS", "ESTADO")), None)
+if _status_col_ui is not None:
+    _n_fact = int(df_combined[_status_col_ui].astype(str).str.upper().str.contains("FACTURAD", na=False).sum())
+    st.caption(f"📄 El archivo incluye la hoja **Facturadas** con {_n_fact:,} OT(s) facturadas — el Car Tracker las archiva automáticamente al importar.")
 
 st.download_button(
     label="⬇️  Descargar Excels_Combinados.xlsx",
