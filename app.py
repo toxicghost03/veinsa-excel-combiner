@@ -11,6 +11,7 @@ st.set_page_config(
 )
 
 COLUMNA_PLACA = "TAG"
+COLUMNA_VIN_FACT = "VIN NO"  # firma del reporte de Facturados (Invoice) — no trae columna TAG
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("🚗 Combinador de Excels — Veinsa")
@@ -73,17 +74,39 @@ def find_tag_column(df):
     return None, df.columns.tolist()
 
 
+def find_vin_column(df):
+    """Detecta el reporte de Facturados/Invoice: no tiene TAG, pero sí VIN NO."""
+    df.columns = df.columns.astype(str).str.strip()
+    if COLUMNA_PLACA in df.columns:
+        return None, df.columns.tolist()
+    if COLUMNA_VIN_FACT in df.columns:
+        return df, None
+    for i in range(min(10, len(df))):
+        fila = [str(v).strip() for v in df.iloc[i].values]
+        if COLUMNA_VIN_FACT in fila and COLUMNA_PLACA not in fila:
+            df.columns = df.iloc[i].values
+            df = df.iloc[i + 1:].reset_index(drop=True)
+            df.columns = df.columns.astype(str).str.strip()
+            return df, None
+    return None, df.columns.tolist()
+
+
 lista_dfs = []
+lista_facturadas = []
 errores = []
 
 for f in uploaded:
     try:
-        df = read_file(f)
-        df, cols_encontradas = find_tag_column(df)
-        if df is None:
-            errores.append((f.name, cols_encontradas))
+        df_raw = read_file(f)
+        df_tag, cols_encontradas = find_tag_column(df_raw)
+        if df_tag is not None:
+            lista_dfs.append((f.name, df_tag))
+            continue
+        df_vin, _ = find_vin_column(df_raw)
+        if df_vin is not None:
+            lista_facturadas.append((f.name, df_vin))
         else:
-            lista_dfs.append((f.name, df))
+            errores.append((f.name, cols_encontradas))
     except Exception as e:
         errores.append((f.name, [f"ERROR: {e}"]))
 
@@ -94,36 +117,44 @@ for nombre, cols in errores:
             f"Este archivo es probablemente un reporte diferente. "
             f"Columnas encontradas: `{', '.join(str(c) for c in cols[:12])}`\n\n"
             f"Asegurate de exportar el reporte **Open Repair Orders** o **Finished Repair Orders** "
-            f"que incluya la columna TAG."
+            f"que incluya la columna TAG, o el reporte de **Facturados/Invoice** que incluya la columna VIN NO."
         )
     else:
         st.error(f"**{nombre}** — no se pudo leer el archivo.")
 
-if not lista_dfs:
-    st.error("Ningún archivo tiene la columna TAG. Revisa los archivos subidos.")
+if not lista_dfs and not lista_facturadas:
+    st.error("Ningún archivo tiene la columna TAG ni VIN NO. Revisa los archivos subidos.")
     st.stop()
 
 # ── Summary cards ─────────────────────────────────────────────────────────────
-cols = st.columns(len(lista_dfs))
-for col, (nombre, df) in zip(cols, lista_dfs):
+_todas = lista_dfs + [(f"{n} (Facturados)", d) for n, d in lista_facturadas]
+cols = st.columns(len(_todas))
+for col, (nombre, df) in zip(cols, _todas):
     col.metric(nombre, f"{len(df):,} filas")
 
 # ── Combine ───────────────────────────────────────────────────────────────────
-df_combined = pd.concat([df for _, df in lista_dfs], ignore_index=True)
-
-df_combined["Placa_Match"] = (
-    df_combined[COLUMNA_PLACA]
-    .astype(str)
-    .str.replace(r"[^A-Z0-9]", "", regex=True)
-    .str.upper()
-)
-if "VIN NO" in df_combined.columns:
-    df_combined["VIN_Match"] = (
-        df_combined["VIN NO"]
+if lista_dfs:
+    df_combined = pd.concat([df for _, df in lista_dfs], ignore_index=True)
+    df_combined["Placa_Match"] = (
+        df_combined[COLUMNA_PLACA]
         .astype(str)
-        .str.replace(r"[^A-HJ-NPR-Z0-9]", "", regex=True)
+        .str.replace(r"[^A-Z0-9]", "", regex=True)
         .str.upper()
     )
+    if "VIN NO" in df_combined.columns:
+        df_combined["VIN_Match"] = (
+            df_combined["VIN NO"]
+            .astype(str)
+            .str.replace(r"[^A-HJ-NPR-Z0-9]", "", regex=True)
+            .str.upper()
+        )
+else:
+    df_combined = pd.DataFrame()
+
+df_facturadas = (
+    pd.concat([df for _, df in lista_facturadas], ignore_index=True)
+    if lista_facturadas else pd.DataFrame()
+)
 
 st.divider()
 st.subheader(f"Vista previa — {len(df_combined):,} registros en total")
@@ -139,30 +170,31 @@ if search:
 
 st.dataframe(df_view.fillna(""), use_container_width=True, height=380)
 
+if not df_facturadas.empty:
+    st.markdown(f"**📄 Facturados (VIN NO) — {len(df_facturadas):,} registros**")
+    st.dataframe(df_facturadas.fillna(""), use_container_width=True, height=220)
+
 # ── Build Excel in memory ─────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def build_excel(data_json: str) -> bytes:
+def build_excel(data_json: str, fact_json: str = "[]") -> bytes:
     df = pd.read_json(io.StringIO(data_json), orient="records")
+    df_fact_src = pd.read_json(io.StringIO(fact_json), orient="records")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df_out = df.fillna("")
-        df_out.to_excel(writer, sheet_name="Sistema_Completo", index=False)
-        ws = writer.sheets["Sistema_Completo"]
-        wb = writer.book
-        for i, col in enumerate(df_out.columns):
-            ancho = max(df_out[col].astype(str).map(len).max(), len(str(col))) + 2
-            ws.set_column(i, i, min(ancho, 50))
-        ws.add_table(0, 0, len(df_out), len(df_out.columns) - 1, {
-            "columns": [{"header": c} for c in df_out.columns],
-            "style": "Table Style Medium 9",
-        })
+        if not df_out.empty:
+            df_out.to_excel(writer, sheet_name="Sistema_Completo", index=False)
+            ws = writer.sheets["Sistema_Completo"]
+            for i, col in enumerate(df_out.columns):
+                ancho = max(df_out[col].astype(str).map(len).max(), len(str(col))) + 2
+                ws.set_column(i, i, min(ancho, 50))
+            ws.add_table(0, 0, len(df_out), len(df_out.columns) - 1, {
+                "columns": [{"header": c} for c in df_out.columns],
+                "style": "Table Style Medium 9",
+            })
 
-        # ── Hoja dedicada: solo OTs FACTURADAS ──
-        _status_col = next((c for c in df_out.columns if str(c).strip().upper() in ("STATUS", "ESTATUS", "ESTADO")), None)
-        if _status_col is not None:
-            df_fact = df_out[df_out[_status_col].astype(str).str.upper().str.contains("FACTURAD", na=False)]
-        else:
-            df_fact = df_out.iloc[0:0]
+        # ── Hoja dedicada: reporte de Facturados/Invoice (VIN NO, RO, etc.) ──
+        df_fact = df_fact_src.fillna("")
         df_fact.to_excel(writer, sheet_name="Facturadas", index=False)
         if len(df_fact) > 0:
             ws_f = writer.sheets["Facturadas"]
@@ -179,12 +211,15 @@ def build_excel(data_json: str) -> bytes:
 st.divider()
 
 with st.spinner("Generando archivo..."):
-    excel_bytes = build_excel(df_combined.to_json(orient="records"))
+    excel_bytes = build_excel(
+        df_combined.to_json(orient="records") if not df_combined.empty else "[]",
+        df_facturadas.to_json(orient="records") if not df_facturadas.empty else "[]",
+    )
 
-_status_col_ui = next((c for c in df_combined.columns if str(c).strip().upper() in ("STATUS", "ESTATUS", "ESTADO")), None)
-if _status_col_ui is not None:
-    _n_fact = int(df_combined[_status_col_ui].astype(str).str.upper().str.contains("FACTURAD", na=False).sum())
-    st.caption(f"📄 El archivo incluye la hoja **Facturadas** con {_n_fact:,} OT(s) facturadas — el Car Tracker las archiva automáticamente al importar.")
+if len(df_facturadas) > 0:
+    st.caption(f"📄 El archivo incluye la hoja **Facturadas** con {len(df_facturadas):,} OT(s) facturadas (por VIN) — el Car Tracker las archiva automáticamente al importar.")
+else:
+    st.caption("ℹ️ No se subió ningún reporte de Facturados/Invoice — la hoja **Facturadas** se incluirá vacía. Subí ese reporte (columna VIN NO) si querés que el Car Tracker archive automáticamente.")
 
 st.download_button(
     label="⬇️  Descargar Excels_Combinados.xlsx",
